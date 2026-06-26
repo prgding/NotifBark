@@ -1,0 +1,17 @@
+# 本地密钥与配置（含 Bark key，切勿提交）
+config.json
+
+# 签名证书与私钥（切勿提交）
+cert/
+*.p12
+*.pem
+*.cer
+*.key
+
+# 构建产物
+build/
+*.app/
+DerivedData/
+
+# 系统
+.DS_Store
