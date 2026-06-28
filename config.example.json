@@ -1,5 +1,5 @@
 {
   "barkUrl": "https://api.day.app/YOUR_KEY",
-  "whitelist": ["com.anthropic.claudefordesktop"],
+  "whitelist": ["com.anthropic.claudefordesktop", "com.openai.codex"],
   "pollSeconds": 3
 }

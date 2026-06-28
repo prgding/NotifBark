@@ -1,13 +1,13 @@
 # NotifBark
 
-把 **macOS 通知**（默认只转 Claude 桌面版）实时转发到手机 **[Bark](https://github.com/Finb/Bark)** 的菜单栏小程序。
+把 **macOS 通知**（默认转 Claude 和 Codex 桌面版）实时转发到手机 **[Bark](https://github.com/Finb/Bark)** 的菜单栏小程序。
 
 macOS 没有公开 API 实时监听通知，本工具的做法是：轮询系统通知数据库 → 解析出新通知 → 按白名单过滤 → 用 Bark 的 HTTP 接口推到手机。一个菜单栏图标即可看状态、开关、跳转授权。
 
 ## 特性
 
 - 🔔 菜单栏图标：状态（转发中 / 暂停 / 无权限）、上次转发、一键开关、发送测试、直达「完全磁盘访问」设置
-- 🎯 按 app 过滤（bundle id 白名单），默认只转 `com.anthropic.claudefordesktop`
+- 🎯 按 app 过滤（bundle id 白名单），默认转 `com.anthropic.claudefordesktop` 和 `com.openai.codex`
 - 🔒 **单一用途**：只读系统通知数据库这一个文件，对其**零写入、零加锁**（拷贝到临时目录再读）
 - 🪪 **自签名**：用一张本地自签名证书签名，TCC 按证书身份认 app，**重新编译不会让完全磁盘访问授权失效**，无需反复授权
 - 🚀 开机自启（LaunchAgent）
@@ -46,7 +46,7 @@ cp config.example.json ~/.notif2bark/config.json
 ```json
 {
   "barkUrl": "https://api.day.app/YOUR_KEY",
-  "whitelist": ["com.anthropic.claudefordesktop"],
+  "whitelist": ["com.anthropic.claudefordesktop", "com.openai.codex"],
   "pollSeconds": 3
 }
 ```

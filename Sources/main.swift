@@ -11,6 +11,8 @@ let HOME = FileManager.default.homeDirectoryForCurrentUser.path
 let DB_BASE = HOME + "/Library/Group Containers/group.com.apple.usernoted/db2/db"
 let CONFIG_PATH = HOME + "/.notif2bark/config.json"
 let LOG_PATH = HOME + "/.notif2bark/notifbark.log"
+let legacyDefaultWhitelist: Set<String> = ["com.anthropic.claudefordesktop"]
+let currentDefaultWhitelist: Set<String> = ["com.anthropic.claudefordesktop", "com.openai.codex"]
 
 // ===== 配置 =====
 struct Config {
@@ -31,7 +33,7 @@ func loadConfig() -> Config? {
             let template = """
             {
               "barkUrl": "https://api.day.app/YOUR_KEY",
-              "whitelist": ["com.anthropic.claudefordesktop"],
+              "whitelist": ["com.anthropic.claudefordesktop", "com.openai.codex"],
               "pollSeconds": 3
             }
             """
@@ -41,7 +43,11 @@ func loadConfig() -> Config? {
         }
         return nil
     }
-    let wl = Set((obj["whitelist"] as? [String]) ?? [])
+    var wl = Set((obj["whitelist"] as? [String]) ?? [])
+    if wl == legacyDefaultWhitelist {
+        wl = currentDefaultWhitelist
+        appLog("检测到历史默认白名单，自动补充 Codex: com.openai.codex")
+    }
     let poll = (obj["pollSeconds"] as? Double) ?? 3.0
     return Config(barkURL: url, whitelist: wl, poll: poll)
 }
@@ -67,7 +73,8 @@ func shortTime() -> String {
 // ===== 读通知库(copy 方案) =====
 struct ReaderError: Error { let noPermission: Bool; let msg: String }
 
-func readNew(after lastId: Int64) throws -> [(Int64, Data)] {
+// 返回 (新记录, 库内真实最大 rec_id)。后者用于检测库被重置/回滚。
+func readNew(after lastId: Int64) throws -> (rows: [(Int64, Data)], dbMax: Int64) {
     let fm = FileManager.default
     let stamp = Int(Date().timeIntervalSince1970 * 1000) % 100000
     let tmpDir = NSTemporaryDirectory() + "notifbark_\(getpid())_\(stamp)"
@@ -84,8 +91,13 @@ func readNew(after lastId: Int64) throws -> [(Int64, Data)] {
             || "\(error)".contains("permitted")
         throw ReaderError(noPermission: perm, msg: "copy db: \(error)")
     }
+    // WAL 模式必须把 -wal 和 -shm 一起拷过去，SQLite 才能用权威帧索引完整读到最新提交；
+    // 只拷 -wal 缺 -shm 时恢复是保守的，活跃大 WAL 会读不全（漏新通知的根因）。
     if fm.fileExists(atPath: DB_BASE + "-wal") {
         try? fm.copyItem(atPath: DB_BASE + "-wal", toPath: tmpDB + "-wal")
+    }
+    if fm.fileExists(atPath: DB_BASE + "-shm") {
+        try? fm.copyItem(atPath: DB_BASE + "-shm", toPath: tmpDB + "-shm")
     }
 
     var db: OpaquePointer?
@@ -94,6 +106,9 @@ func readNew(after lastId: Int64) throws -> [(Int64, Data)] {
         throw ReaderError(noPermission: false, msg: "open copy: \(m)")
     }
     defer { sqlite3_close(db) }
+
+    // 强制把 WAL 完整并入主库副本，确保后续查询看到最新数据。
+    sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", nil, nil, nil)
 
     var stmt: OpaquePointer?
     let sql = "SELECT rec_id, data FROM record WHERE rec_id > ? ORDER BY rec_id"
@@ -113,7 +128,16 @@ func readNew(after lastId: Int64) throws -> [(Int64, Data)] {
         }
         rows.append((rid, data))
     }
-    return rows
+
+    // 库内真实最大 rec_id（用于检测库被重置/回滚）。
+    var maxStmt: OpaquePointer?
+    var maxRid: Int64 = 0
+    if sqlite3_prepare_v2(db, "SELECT max(rec_id) FROM record", -1, &maxStmt, nil) == SQLITE_OK {
+        if sqlite3_step(maxStmt) == SQLITE_ROW { maxRid = sqlite3_column_int64(maxStmt, 0) }
+    }
+    sqlite3_finalize(maxStmt)
+
+    return (rows, maxRid)
 }
 
 func decode(_ blob: Data) -> (String, String, String, String)? {
@@ -128,18 +152,43 @@ func decode(_ blob: Data) -> (String, String, String, String)? {
     return (bundle, title, sub, body)
 }
 
-func pushBark(_ barkURL: String, title: String, body: String) {
+// 同步推送一次：成功(HTTP 2xx)返回 true，否则 false。最长等 timeout 秒。
+func pushBarkOnce(_ barkURL: String, title: String, body: String, timeout: TimeInterval = 10) -> Bool {
     func enc(_ s: String) -> String {
         var cs = CharacterSet.alphanumerics; cs.insert(charactersIn: "-._~")
         return s.addingPercentEncoding(withAllowedCharacters: cs) ?? ""
     }
-    guard let url = URL(string: barkURL) else { return }
+    guard let url = URL(string: barkURL) else { return false }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
+    req.timeoutInterval = timeout
     req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     let payload = "title=\(enc(title))&body=\(enc(body))&group=NotifBark&isArchive=1"
     req.httpBody = payload.data(using: .utf8)
-    URLSession.shared.dataTask(with: req).resume()
+
+    let sem = DispatchSemaphore(value: 0)
+    var ok = false
+    var errMsg = ""
+    let task = URLSession.shared.dataTask(with: req) { _, resp, err in
+        if let err = err { errMsg = err.localizedDescription }
+        else if let code = (resp as? HTTPURLResponse)?.statusCode {
+            ok = (200...299).contains(code)
+            if !ok { errMsg = "HTTP \(code)" }
+        }
+        sem.signal()
+    }
+    task.resume()
+    if sem.wait(timeout: .now() + timeout + 1) == .timedOut {
+        task.cancel(); errMsg = "本地等待超时"
+    }
+    if !ok && !errMsg.isEmpty { appLog("推送失败(\(errMsg)): \(title)") }
+    return ok
+}
+
+// 带 1 次重试的推送。
+func pushBark(_ barkURL: String, title: String, body: String) -> Bool {
+    if pushBarkOnce(barkURL, title: title, body: body) { return true }
+    return pushBarkOnce(barkURL, title: title, body: body)   // 重试一次
 }
 
 // ===== 转发器 =====
@@ -149,6 +198,8 @@ final class Forwarder {
     var onUpdate: (() -> Void)?
     private var timer: Timer?
     private let defaults = UserDefaults.standard
+    private let workQ = DispatchQueue(label: "notifbark.work")
+    private var ticking = false
     var config: Config?
 
     var enabled: Bool {
@@ -169,34 +220,59 @@ final class Forwarder {
 
     private func set(_ s: Status) { status = s; onUpdate?() }
 
+    // 在主线程定时触发，把耗时的读库+网络推送丢到后台队列；同一时刻只跑一个。
     private func tick() {
         guard let cfg = config else { set(.noConfig); return }
         guard enabled else { set(.paused); return }
+        if ticking { return }
+        ticking = true
+        workQ.async { [weak self] in
+            self?.runOnce(cfg)
+            DispatchQueue.main.async { self?.ticking = false }
+        }
+    }
+
+    // 真正干活：读新记录，按 rec_id 顺序推送；只把“连续成功”的最大 rec_id 提交为 lastId。
+    // 一旦某条推送失败，就停在它前面，下一轮从这里重试 —— 保证至少一次、且不重复已成功的。
+    private func runOnce(_ cfg: Config) {
         do {
-            var lid = lastId
+            let lid = lastId
             if lid == 0 {                       // 首启基线，不补发历史
-                let rows = try readNew(after: 0)
-                lid = rows.map { $0.0 }.max() ?? 0
-                lastId = lid
-                appLog("初始化基线 rec_id=\(lid)")
-                set(.forwarding); return
+                let (_, dbMax) = try readNew(after: 0)
+                lastId = dbMax
+                appLog("初始化基线 rec_id=\(dbMax)")
+                DispatchQueue.main.async { self.set(.forwarding) }
+                return
             }
-            let rows = try readNew(after: lid)
+            let (rows, dbMax) = try readNew(after: lid)
+            // 库被重置/回滚（rec_id 计数器退回）：游标比库内最大值还大 → 重新基线，否则永远过滤掉新通知。
+            if dbMax < lid {
+                appLog("检测到通知库重置(dbMax=\(dbMax) < lastId=\(lid))，游标回退基线")
+                lastId = dbMax
+                DispatchQueue.main.async { self.set(.forwarding) }
+                return
+            }
+            var commit = lid                    // 已确认安全提交到的位置
             for (rid, blob) in rows {
-                if rid > lid { lid = rid }
-                guard let (bundle, title, sub, body) = decode(blob) else { continue }
-                if !cfg.whitelist.isEmpty && !cfg.whitelist.contains(bundle) { continue }
+                guard let (bundle, title, sub, body) = decode(blob) else { commit = rid; continue }
+                if !cfg.whitelist.isEmpty && !cfg.whitelist.contains(bundle) { commit = rid; continue }
                 let t = title.isEmpty ? bundle : title
                 let b = sub.isEmpty ? body : (sub + " " + body)
-                pushBark(cfg.barkURL, title: t, body: b)
-                lastForward = "\(shortTime())  \(t)"
-                appLog("已转发 rec=\(rid) [\(bundle)] \(t) | \(b)")
+                if pushBark(cfg.barkURL, title: t, body: b) {
+                    commit = rid
+                    let line = "\(shortTime())  \(t)"
+                    DispatchQueue.main.async { self.lastForward = line }
+                    appLog("已转发 rec=\(rid) [\(bundle)] \(t) | \(b)")
+                } else {
+                    appLog("推送失败放弃推进 rec=\(rid)，下轮重试 [\(bundle)] \(t)")
+                    break                       // 不提交这条及之后的，留待下轮
+                }
             }
-            lastId = lid
-            set(.forwarding)
+            lastId = commit
+            DispatchQueue.main.async { self.set(.forwarding) }
         } catch let e as ReaderError {
-            if e.noPermission { set(.noPermission) }
-            else { set(.forwarding); appLog("读取出错: \(e.msg)") }
+            if e.noPermission { DispatchQueue.main.async { self.set(.noPermission) } }
+            else { DispatchQueue.main.async { self.set(.forwarding) }; appLog("读取出错: \(e.msg)") }
         } catch {
             appLog("未知错误: \(error)")
         }
@@ -263,7 +339,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggle() { fwd.enabled.toggle(); refresh() }
     @objc func sendTest() {
-        if let u = fwd.config?.barkURL { pushBark(u, title: "NotifBark 自测", body: "菜单栏发出的测试推送 ✅") }
+        guard let u = fwd.config?.barkURL else { return }
+        DispatchQueue.global().async {
+            let ok = pushBark(u, title: "NotifBark 自测", body: "菜单栏发出的测试推送 ✅")
+            appLog(ok ? "测试推送成功" : "测试推送失败(见上条)")
+        }
     }
     @objc func openFDA() {
         if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
