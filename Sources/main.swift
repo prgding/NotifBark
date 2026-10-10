@@ -6,13 +6,12 @@
 import AppKit
 import Foundation
 import SQLite3
+import Dispatch
 
 let HOME = FileManager.default.homeDirectoryForCurrentUser.path
 let DB_BASE = HOME + "/Library/Group Containers/group.com.apple.usernoted/db2/db"
 let CONFIG_PATH = HOME + "/.notif2bark/config.json"
 let LOG_PATH = HOME + "/.notif2bark/notifbark.log"
-let legacyDefaultWhitelist: Set<String> = ["com.anthropic.claudefordesktop"]
-let currentDefaultWhitelist: Set<String> = ["com.anthropic.claudefordesktop", "com.openai.codex"]
 
 // ===== 配置 =====
 struct Config {
@@ -43,11 +42,7 @@ func loadConfig() -> Config? {
         }
         return nil
     }
-    var wl = Set((obj["whitelist"] as? [String]) ?? [])
-    if wl == legacyDefaultWhitelist {
-        wl = currentDefaultWhitelist
-        appLog("检测到历史默认白名单，自动补充 Codex: com.openai.codex")
-    }
+    let wl = Set((obj["whitelist"] as? [String]) ?? [])
     let poll = (obj["pollSeconds"] as? Double) ?? 3.0
     return Config(barkURL: url, whitelist: wl, poll: poll)
 }
@@ -152,6 +147,30 @@ func decode(_ blob: Data) -> (String, String, String, String)? {
     return (bundle, title, sub, body)
 }
 
+func appTitlePrefix(for bundle: String) -> String? {
+    switch bundle {
+    case "com.openai.codex":
+        return "Codex - "
+    case "com.anthropic.claudefordesktop":
+        return "Claude - "
+    default:
+        return nil
+    }
+}
+
+func formatTitle(bundle: String, title: String) -> String {
+    let base = title.isEmpty ? bundle : title
+    guard let prefix = appTitlePrefix(for: bundle), !base.hasPrefix(prefix) else { return base }
+    return prefix + base
+}
+
+func formatBody(bundle: String, subtitle: String, body: String) -> String {
+    if bundle == "com.openai.codex" {
+        return "Codex is waiting for your reading."
+    }
+    return subtitle.isEmpty ? body : (subtitle + " " + body)
+}
+
 // 同步推送一次：成功(HTTP 2xx)返回 true，否则 false。最长等 timeout 秒。
 func pushBarkOnce(_ barkURL: String, title: String, body: String, timeout: TimeInterval = 10) -> Bool {
     func enc(_ s: String) -> String {
@@ -200,6 +219,9 @@ final class Forwarder {
     private let defaults = UserDefaults.standard
     private let workQ = DispatchQueue(label: "notifbark.work")
     private var ticking = false
+    private var watcherSources: [DispatchSourceFileSystemObject] = []
+    private var watcherFDs: [Int32] = []
+    private var triggerPending = false
     var config: Config?
 
     var enabled: Bool {
@@ -214,11 +236,63 @@ final class Forwarder {
     func start() {
         let poll = config?.poll ?? 3.0
         timer = Timer.scheduledTimer(withTimeInterval: poll, repeats: true) { [weak self] _ in self?.tick() }
-        timer?.tolerance = 0.8
+        timer?.tolerance = min(0.2, poll * 0.1)
+        startWatchers()
         tick()
     }
 
+    deinit {
+        timer?.invalidate()
+        stopWatchers()
+    }
+
     private func set(_ s: Status) { status = s; onUpdate?() }
+
+    private func startWatchers() {
+        stopWatchers()
+        // 盯目录和 db/wal 文件；目录事件可覆盖 wal 被重建、改名等场景。
+        watch(path: HOME + "/Library/Group Containers/group.com.apple.usernoted/db2",
+              flags: O_EVTONLY, mask: [.write, .rename, .delete, .extend, .attrib])
+        watch(path: DB_BASE, flags: O_EVTONLY, mask: [.write, .rename, .delete, .extend])
+        watch(path: DB_BASE + "-wal", flags: O_EVTONLY, mask: [.write, .rename, .delete, .extend])
+    }
+
+    private func stopWatchers() {
+        for src in watcherSources {
+            src.setEventHandler {}
+            src.setCancelHandler {}
+            src.cancel()
+        }
+        watcherSources.removeAll()
+        for fd in watcherFDs where fd >= 0 { close(fd) }
+        watcherFDs.removeAll()
+    }
+
+    private func watch(path: String,
+                       flags: Int32,
+                       mask: DispatchSource.FileSystemEvent) {
+        let fd = open(path, flags)
+        guard fd >= 0 else { return }
+        watcherFDs.append(fd)
+
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
+                                                            eventMask: mask,
+                                                            queue: workQ)
+        src.setEventHandler { [weak self] in self?.scheduleTriggeredTick() }
+        src.setCancelHandler {}
+        src.resume()
+        watcherSources.append(src)
+    }
+
+    private func scheduleTriggeredTick() {
+        if triggerPending { return }
+        triggerPending = true
+        workQ.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.triggerPending = false
+            DispatchQueue.main.async { self.tick() }
+        }
+    }
 
     // 在主线程定时触发，把耗时的读库+网络推送丢到后台队列；同一时刻只跑一个。
     private func tick() {
@@ -256,8 +330,8 @@ final class Forwarder {
             for (rid, blob) in rows {
                 guard let (bundle, title, sub, body) = decode(blob) else { commit = rid; continue }
                 if !cfg.whitelist.isEmpty && !cfg.whitelist.contains(bundle) { commit = rid; continue }
-                let t = title.isEmpty ? bundle : title
-                let b = sub.isEmpty ? body : (sub + " " + body)
+                let t = formatTitle(bundle: bundle, title: title)
+                let b = formatBody(bundle: bundle, subtitle: sub, body: body)
                 if pushBark(cfg.barkURL, title: t, body: b) {
                     commit = rid
                     let line = "\(shortTime())  \(t)"

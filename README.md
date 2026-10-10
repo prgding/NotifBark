@@ -1,16 +1,17 @@
 # NotifBark
 
-把 **macOS 通知**（默认转 Claude 和 Codex 桌面版）实时转发到手机 **[Bark](https://github.com/Finb/Bark)** 的菜单栏小程序。
+把 **macOS 通知**（配置模板默认包含 Claude 和 Codex 桌面版）实时转发到手机 **[Bark](https://github.com/Finb/Bark)** 的菜单栏小程序。
 
-macOS 没有公开 API 实时监听通知，本工具的做法是：轮询系统通知数据库 → 解析出新通知 → 按白名单过滤 → 用 Bark 的 HTTP 接口推到手机。一个菜单栏图标即可看状态、开关、跳转授权。
+macOS 没有公开 API 实时监听通知，本工具的做法是：监听通知库文件变化并定时兜底扫描 → 解析出新通知 → 按白名单过滤 → 用 Bark 的 HTTP 接口推到手机。一个菜单栏图标即可看状态、开关、跳转授权。
 
 ## 特性
 
 - 🔔 菜单栏图标：状态（转发中 / 暂停 / 无权限）、上次转发、一键开关、发送测试、直达「完全磁盘访问」设置
-- 🎯 按 app 过滤（bundle id 白名单），默认转 `com.anthropic.claudefordesktop` 和 `com.openai.codex`
+- 🎯 按 app 过滤（bundle id 白名单），配置模板默认包含 `com.anthropic.claudefordesktop` 和 `com.openai.codex`
+- 🧭 Codex / Claude 推送标题会自动加来源前缀；Codex 正文固定为 `Codex is waiting for your reading.`
 - 🔒 **单一用途**：只读系统通知数据库这一个文件，对其**零写入、零加锁**（拷贝到临时目录再读）
 - 🪪 **自签名**：用一张本地自签名证书签名，TCC 按证书身份认 app，**重新编译不会让完全磁盘访问授权失效**，无需反复授权
-- 🚀 开机自启（LaunchAgent）
+- 🚀 登录时自启（LaunchAgent），异常退出时自动重启，手动退出后保持关闭
 
 ## 要求
 
@@ -36,7 +37,7 @@ cp config.example.json ~/.notif2bark/config.json
 
 # 4) 授予完全磁盘访问
 #    菜单栏 NotifBark 图标 → 「打开『完全磁盘访问』设置」
-#    把 ~/Applications/NotifBark.app 加进列表并打开
+#    把 /Applications/NotifBark.app 加进列表并打开
 ```
 
 授权后菜单栏图标会从 ⚠️ 变成 🔔，点「发送测试推送」验证手机能收到即可。
@@ -54,7 +55,7 @@ cp config.example.json ~/.notif2bark/config.json
 - `barkUrl`：你的 Bark 推送地址（官方服务器或自建）
 - `whitelist`：要转发的 app bundle id 列表；**留空 `[]` 表示转发全部 app**
   - 查某个 app 的 bundle id：`osascript -e 'id of app "应用名"'`，例如微信是 `com.tencent.xinWeChat`
-- `pollSeconds`：轮询间隔秒数
+- `pollSeconds`：兜底扫描间隔秒数；正常情况下文件变化会更快触发读取
 
 改完配置后从菜单栏退出再重新打开（或重启服务）生效。
 
@@ -73,7 +74,7 @@ cp config.example.json ~/.notif2bark/config.json
 ```bash
 launchctl bootout gui/$(id -u)/com.dings.notifbark
 rm -f ~/Library/LaunchAgents/com.dings.notifbark.plist
-rm -rf ~/Applications/NotifBark.app ~/.notif2bark
+rm -rf /Applications/NotifBark.app ~/.notif2bark
 # 再到 系统设置 → 隐私与安全性 → 完全磁盘访问 删掉 NotifBark 条目
 ```
 

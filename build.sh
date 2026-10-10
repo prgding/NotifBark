@@ -5,7 +5,7 @@ set -e
 
 CN="NotifBark Self Signed"
 BUNDLE_ID="com.dings.notifbark"
-APP="$HOME/Applications/NotifBark.app"
+APP="/Applications/NotifBark.app"
 SRC="$(cd "$(dirname "$0")" && pwd)/Sources/main.swift"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 U=$(id -u)
@@ -54,17 +54,20 @@ cat > "$PLIST" <<EOF
   <key>ProgramArguments</key>
   <array><string>$APP/Contents/MacOS/NotifBark</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
 </dict>
 </plist>
 EOF
 
-launchctl bootout "gui/$U/$BUNDLE_ID" 2>/dev/null || true
-launchctl bootstrap "gui/$U" "$PLIST"
+launchctl asuser "$U" launchctl bootout "gui/$U/$BUNDLE_ID" 2>/dev/null || true
+launchctl asuser "$U" launchctl bootstrap "gui/$U" "$PLIST"
 
 echo
 echo "✓ 完成。NotifBark 已安装并启动（菜单栏出现图标）。"
 echo "  首次使用："
 echo "   1) cp config.example.json ~/.notif2bark/config.json，填入你的 Bark key"
-echo "   2) 菜单栏图标 → 「打开『完全磁盘访问』设置」→ 把 ~/Applications/NotifBark.app 加进去并打开"
+echo "   2) 菜单栏图标 → 「打开『完全磁盘访问』设置」→ 把 /Applications/NotifBark.app 加进去并打开"
 echo "   3) 菜单栏图标 → 「发送测试推送」验证手机收到"
